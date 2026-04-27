@@ -40,22 +40,47 @@ import (
 
 // Config describes how a Registry resolves pools.
 //
-// Exactly one of DatabaseURL or DSNBuilder must be set. DatabaseURL puts
-// the Registry in single-database mode (every Get returns the same
-// pool). DSNBuilder puts it in multi-tenant mode, in which case Resolver
-// is also required so HTTP middleware can identify the tenant for each
-// request. Background workers that call Get directly do not need a
-// Resolver.
+// Exactly one of DatabaseURL, DSNBuilder, or DSNTemplate must be set.
+//
+//   - DatabaseURL: single-database mode. Every Get returns the same
+//     pool; tenantID is ignored.
+//   - DSNBuilder: multi-tenant mode, raw form. The caller fully owns
+//     the DSN string returned per tenant — useful when the secret
+//     source is bespoke (vault token sidecar, etc).
+//   - DSNTemplate + PasswordResolver: multi-tenant mode, declarative
+//     form. The template substitutes {{tenant}} and {{password}}; the
+//     resolver supplies the password per-tenant. Production callers
+//     should land here so password fetch + caching is one well-tested
+//     path across modules.
+//
+// Resolver (HTTP tenant identification) is required for any multi-tenant
+// caller that uses Middleware; background workers that call Get with
+// explicit tenant IDs can omit it.
 type Config struct {
-	// DatabaseURL puts the Registry in single-database mode. Ignored when
-	// DSNBuilder is set.
+	// DatabaseURL puts the Registry in single-database mode.
 	DatabaseURL string
 
 	// DSNBuilder returns the connection string for a given tenant ID.
-	// Required in multi-tenant mode. Typical implementations come from
-	// the SupavisorDSN / PgBouncerDSN / DirectDSN helpers in this
+	// Mutually exclusive with DSNTemplate. Typical implementations come
+	// from the SupavisorDSN / PgBouncerDSN / DirectDSN helpers in this
 	// package, or a custom closure built by the caller.
 	DSNBuilder func(tenantID string) (string, error)
+
+	// DSNTemplate is the per-tenant connection string template with
+	// {{tenant}} and (optionally) {{password}} placeholders. Used in
+	// combination with PasswordResolver — the registry handles the
+	// substitution + password fetch. Mutually exclusive with DSNBuilder.
+	//
+	// Example:
+	//
+	//	postgres://palbase_auth.{{tenant}}:{{password}}@supavisor:5432/{{tenant}}?sslmode=disable
+	DSNTemplate string
+
+	// PasswordResolver supplies the tenant role password substituted
+	// into DSNTemplate's {{password}} placeholder. Required when the
+	// template contains {{password}}. Wrap with
+	// NewCachingPasswordResolver for production deployments.
+	PasswordResolver PasswordResolver
 
 	// Resolver extracts the tenant ID from an HTTP request for use by
 	// Middleware. Optional when the Registry is only consumed by
@@ -120,11 +145,30 @@ type poolEntry struct {
 // called. In single-database mode the single pool is opened eagerly so
 // configuration errors surface at startup.
 func New(cfg Config) (*Registry, error) {
-	if cfg.DatabaseURL == "" && cfg.DSNBuilder == nil {
-		return nil, fmt.Errorf("%w: either DatabaseURL or DSNBuilder must be set", ErrInvalidConfig)
+	modeCount := 0
+	if cfg.DatabaseURL != "" {
+		modeCount++
 	}
-	if cfg.DatabaseURL != "" && cfg.DSNBuilder != nil {
-		return nil, fmt.Errorf("%w: DatabaseURL and DSNBuilder are mutually exclusive", ErrInvalidConfig)
+	if cfg.DSNBuilder != nil {
+		modeCount++
+	}
+	if cfg.DSNTemplate != "" {
+		modeCount++
+	}
+	if modeCount == 0 {
+		return nil, fmt.Errorf("%w: one of DatabaseURL, DSNBuilder, or DSNTemplate must be set", ErrInvalidConfig)
+	}
+	if modeCount > 1 {
+		return nil, fmt.Errorf("%w: DatabaseURL, DSNBuilder, and DSNTemplate are mutually exclusive", ErrInvalidConfig)
+	}
+	// DSNTemplate + PasswordResolver bake into a DSNBuilder so the
+	// hot path stays unchanged below — the registry only knows about
+	// "either single pool or per-tenant builder".
+	if cfg.DSNTemplate != "" {
+		if cfg.PasswordResolver == nil {
+			return nil, fmt.Errorf("%w: DSNTemplate requires PasswordResolver", ErrInvalidConfig)
+		}
+		cfg.DSNBuilder = dsnBuilderFromTemplate(cfg.DSNTemplate, cfg.PasswordResolver)
 	}
 	applyDefaults(&cfg)
 
