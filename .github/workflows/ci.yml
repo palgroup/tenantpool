@@ -1,0 +1,51 @@
+name: tenantpool ci
+
+# Unit gate for the tenantpool library. This is a pure Go library (no
+# binary, no Dockerfile, no deploy) consumed by analytics/messaging — the
+# only pipeline it needs is build + vet + the unit suite on every push to
+# main and every PR. There are no `//go:build integration` files and no
+# testcontainers usage, so there is intentionally no integration job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit + vet + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # go.mod pins go 1.26.2 — read it from there so the workflow
+          # never drifts from the module's toolchain.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -short -race -count=1 ./...
+
+      # golangci-lint: no released version supports go1.26 yet (same
+      # toolchain lag as palanalytics ci / palbase palmessaging-ci) — keep
+      # it reporting but non-blocking; go vet above is the enforced static
+      # gate. TODO: drop continue-on-error once a go1.26-compatible
+      # golangci-lint release ships.
+      - name: Lint
+        continue-on-error: true
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
