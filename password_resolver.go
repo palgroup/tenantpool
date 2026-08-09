@@ -114,12 +114,17 @@ func (r *CachingPasswordResolver) Invalidate(tenantID string) {
 	r.mu.Unlock()
 }
 
-// dsnBuilderFromTemplate produces a DSNBuilder that substitutes {{tenant}}
-// and {{password}} in template. The password comes from resolver on every
-// invocation — caching belongs in the resolver, not here. Used internally
-// when Config carries DSNTemplate + PasswordResolver instead of a raw
+// dsnBuilderFromTemplate produces a DSNBuilder that substitutes {{tenant}},
+// {{password}}, and (optionally) {{pooler}} in template. The password and
+// pooler host come from their resolvers on every invocation — caching
+// belongs in the resolvers, not here. Used internally when Config carries
+// DSNTemplate + PasswordResolver (+ PoolerHostResolver) instead of a raw
 // DSNBuilder.
-func dsnBuilderFromTemplate(template string, resolver PasswordResolver) func(string) (string, error) {
+//
+// hosts may be nil when template has no {{pooler}} placeholder — a
+// half-migrated fleet still has services whose template is a literal
+// pooler host, and those must keep working untouched.
+func dsnBuilderFromTemplate(template string, resolver PasswordResolver, hosts PoolerHostResolver) func(string) (string, error) {
 	return func(tenantID string) (string, error) {
 		if tenantID == "" {
 			return "", errors.New("tenant id is empty")
@@ -138,6 +143,21 @@ func dsnBuilderFromTemplate(template string, resolver PasswordResolver) func(str
 				return "", fmt.Errorf("resolve password for %s: %w", tenantID, err)
 			}
 			dsn = strings.ReplaceAll(dsn, "{{password}}", pw)
+		}
+
+		if strings.Contains(dsn, "{{pooler}}") {
+			if hosts == nil {
+				// Loud failure, not a silent fallback: emitting a literal
+				// template string (or a hardcoded default pool) as a hostname
+				// is exactly how a misconfigured service looks healthy while
+				// every connection lands on the wrong pool.
+				return "", fmt.Errorf("DSNTemplate references {{pooler}} but no PoolerHostResolver was configured")
+			}
+			host, err := hosts.ResolveHost(context.Background(), tenantID)
+			if err != nil {
+				return "", fmt.Errorf("resolve pooler host for %s: %w", tenantID, err)
+			}
+			dsn = strings.ReplaceAll(dsn, "{{pooler}}", host)
 		}
 		return dsn, nil
 	}

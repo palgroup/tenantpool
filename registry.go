@@ -82,6 +82,14 @@ type Config struct {
 	// NewCachingPasswordResolver for production deployments.
 	PasswordResolver PasswordResolver
 
+	// PoolerHostResolver supplies the pooler (Supavisor) host substituted
+	// into DSNTemplate's {{pooler}} placeholder. Required when the
+	// template contains {{pooler}} — tenants are spread across cells and
+	// each cell has its own pooler, so no single literal host is correct
+	// for a multi-tenant service. Use NewOrchestratorPoolerHostResolver
+	// for production deployments.
+	PoolerHostResolver PoolerHostResolver
+
 	// Resolver extracts the tenant ID from an HTTP request for use by
 	// Middleware. Optional when the Registry is only consumed by
 	// background workers that call Get with an explicit tenant ID.
@@ -168,7 +176,7 @@ func New(cfg Config) (*Registry, error) {
 		if cfg.PasswordResolver == nil {
 			return nil, fmt.Errorf("%w: DSNTemplate requires PasswordResolver", ErrInvalidConfig)
 		}
-		cfg.DSNBuilder = dsnBuilderFromTemplate(cfg.DSNTemplate, cfg.PasswordResolver)
+		cfg.DSNBuilder = dsnBuilderFromTemplate(cfg.DSNTemplate, cfg.PasswordResolver, cfg.PoolerHostResolver)
 	}
 	applyDefaults(&cfg)
 
