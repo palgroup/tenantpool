@@ -252,6 +252,12 @@ func (r *Registry) Get(ctx context.Context, tenantID string) (*pgxpool.Pool, err
 		if err != nil {
 			return nil, err
 		}
+		// A resolved pooler host can be stale: routing moves, the registry
+		// healer prunes the old pooler, and the resolver keeps serving its
+		// cached answer for the rest of the TTL. Verify once here and repoint
+		// if the pooler disowns the tenant — see verifyOrRepoint, which changes
+		// nothing for any other error.
+		pool = r.verifyOrRepoint(ctx, tenantID, pool)
 
 		r.mu.Lock()
 		r.cache[tenantID] = &poolEntry{pool: pool, lastAccess: time.Now()}
