@@ -3,6 +3,7 @@ package tenantpool
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -57,7 +58,13 @@ func isTenantUnknownToPooler(err error) bool {
 	if !errors.As(err, &pgErr) {
 		return false
 	}
-	return pgErr.Message == "Tenant or user not found"
+	return isTenantUnknownPgError(pgErr)
+}
+
+// isTenantUnknownPgError is the same recognition against an already-unwrapped
+// error, which is the shape the connection-level hook receives.
+func isTenantUnknownPgError(pgErr *pgconn.PgError) bool {
+	return pgErr != nil && pgErr.Message == "Tenant or user not found"
 }
 
 // verifyOrRepoint dials the freshly built pool once. On the one error that means
@@ -89,12 +96,57 @@ func (r *Registry) verifyOrRepoint(ctx context.Context, tenantID string, pool *p
 	if err != nil {
 		return pool
 	}
-	repointed, err := r.buildPool(ctx, dsn)
+	repointed, err := r.buildPool(ctx, tenantID, dsn)
 	if err != nil {
 		return pool
 	}
 	pool.Close()
 	return repointed
+}
+
+// onPgErrorFor wraps the connection's server-error handler so a pool that is
+// ALREADY established reacts to being disowned.
+//
+// verifyOrRepoint covers only the pool it just built: Get's hot path returns a
+// cached pool without checking anything, and it must — a Ping in front of every
+// query would tax every tenant to protect against a rare event. So once a
+// replica holds a pool, nothing re-examines it. When the healer prunes the
+// tenant from that pooler, every query fails until the entry is evicted or the
+// process restarts.
+//
+// That gap is measured, not theoretical: ~5 minutes of `Tenant or user not
+// found` on 2026-08-09, ended by `kubectl rollout restart` — a restart being the
+// only thing able to clear a cache nothing else could reach.
+//
+// This hook fires on a LIVE connection, which is what closes it. It is
+// deliberately additive: pgx's verdict on whether to close the connection is
+// left exactly as it was, and a caller's own handler still runs and still
+// decides. The reaction runs off this goroutine because it closes the very pool
+// this connection belongs to.
+func (r *Registry) onPgErrorFor(tenantID string, prev pgconn.PgErrorHandler) pgconn.PgErrorHandler {
+	return func(c *pgconn.PgConn, pgErr *pgconn.PgError) bool {
+		if isTenantUnknownPgError(pgErr) {
+			go r.repointAfterDisown(tenantID)
+		}
+		if prev != nil {
+			return prev(c, pgErr)
+		}
+		// pgx's documented default: close on FATAL, keep otherwise.
+		return !strings.EqualFold(pgErr.Severity, "FATAL")
+	}
+}
+
+// repointAfterDisown drops both halves of the stale answer: the cached host, so
+// the next resolve asks the orchestrator, and the pool built from it, so Get
+// stops handing out connections to a pooler that has disowned this tenant.
+//
+// Dropping only the host would leave the pool cached and the outage running;
+// dropping only the pool would rebuild it against the same stale host.
+func (r *Registry) repointAfterDisown(tenantID string) {
+	if inv, ok := r.cfg.PoolerHostResolver.(PoolerHostInvalidator); ok {
+		inv.Invalidate(tenantID)
+	}
+	r.Invalidate(tenantID)
 }
 
 // poolerRepointPingTimeout bounds the acquisition-time check. Short because it

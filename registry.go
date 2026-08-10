@@ -186,7 +186,7 @@ func New(cfg Config) (*Registry, error) {
 	}
 
 	if cfg.DatabaseURL != "" {
-		pool, err := r.buildPool(context.Background(), cfg.DatabaseURL)
+		pool, err := r.buildPool(context.Background(), "", cfg.DatabaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("open single pool: %w", err)
 		}
@@ -248,7 +248,7 @@ func (r *Registry) Get(ctx context.Context, tenantID string) (*pgxpool.Pool, err
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrTenantNotFound, err)
 		}
-		pool, err := r.buildPool(ctx, dsn)
+		pool, err := r.buildPool(ctx, tenantID, dsn)
 		if err != nil {
 			return nil, err
 		}
@@ -283,7 +283,10 @@ func (r *Registry) Get(ctx context.Context, tenantID string) (*pgxpool.Pool, err
 	return v.(*pgxpool.Pool), nil
 }
 
-func (r *Registry) buildPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+// buildPool dials a tenant's pool. tenantID is carried so the connection's
+// server-error hook can name the tenant it must repoint; single mode passes ""
+// and installs no hook, having no tenant to repoint.
+func (r *Registry) buildPool(ctx context.Context, tenantID, dsn string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse dsn: %w", ErrInvalidConfig, err)
@@ -295,6 +298,13 @@ func (r *Registry) buildPool(ctx context.Context, dsn string) (*pgxpool.Pool, er
 		if err := r.cfg.ConfigurePool(cfg); err != nil {
 			return nil, fmt.Errorf("%w: configure pool: %w", ErrInvalidConfig, err)
 		}
+	}
+
+	// AFTER ConfigurePool, so a caller's own handler is the one wrapped rather
+	// than one this overwrites. Without this the hook is dead code — the exact
+	// mistake e97dcb1 had to fix for verifyOrRepoint.
+	if tenantID != "" {
+		cfg.ConnConfig.OnPgError = r.onPgErrorFor(tenantID, cfg.ConnConfig.OnPgError)
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
