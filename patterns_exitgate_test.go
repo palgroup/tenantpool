@@ -1,0 +1,64 @@
+//go:build exitgate
+
+// This file is separated from patterns_test.go by a build constraint and
+// nothing else — a build tag is file-scoped in Go, so a guard that must not run
+// in the default suite cannot share a file with one that must. Its helpers
+// (palbaseRoot, scanGo, report) live in patterns_test.go, which is built under
+// every tag.
+//
+// WHY THE TAG. DEL-016 is a repo-wide removal that no single task performs. The
+// occurrences it forbids are spread across modules owned by T007 (messaging),
+// T008 (notifications, user-flags), T010 (backend/database) and T015
+// (backend/management), plus three in database/proxy. T005 removes the last
+// PoolLess line and writes this guard, but running it here would demand that
+// one task finish four others' work — and the only ways to make it pass early
+// are to widen the task past its file boundary or to weaken the assertion.
+// Neither is acceptable, and a guard that is skipped at runtime (t.Skip) still
+// reads as a passing test in a suite summary, which is its own quiet lie.
+//
+// So it is written now, compiled now, and run at T024 as the run's exit gate:
+//
+//	go test -tags exitgate -run TestDEL016 ./...
+//
+// by which point the owning tasks have swept their modules.
+
+package tenantpool_test
+
+import "testing"
+
+// orchestratorExcluded is pruned from the DEL-016 census, with the reason
+// stated here rather than applied silently: modules/orchestrator is a CLOUD
+// component and is out of scope for the self-host run entirely — it is not one
+// of the four containers (envoy · palsvc · runtime · postgres), it is not built
+// into the self-host image, and no task in this run touches it. Its 14
+// search_path lines belong to the multi-tenant provisioning path that continues
+// to exist in the hosted product. Excluding them keeps this gate honest about
+// what the run actually promised; hiding them behind an unexplained filter
+// would make a green here mean less than it appears to.
+//
+// The exclusion is one named directory, not a pattern. Anything else that grows
+// a search_path must fail this gate.
+var orchestratorExcluded = []string{"modules/orchestrator"}
+
+// TestDEL016_NoSearchPathStatements locks the removal of schema-switching.
+//
+// v1 gave every tenant a schema in one shared database and reached it with
+// `SET search_path TO env_<id>`, which made isolation a property of a session
+// variable: any code path that opened a connection without setting it, or set
+// it from an unvalidated request value, crossed tenants. A single-tenant stack
+// owns its whole database, so the statement has nothing left to select and its
+// continued presence is a door back to the shared-schema model.
+//
+// Mutation: re-add a `SET search_path` anywhere under modules/ or platform/
+// outside the exclusion above, and this test goes red naming the file and line.
+func TestDEL016_NoSearchPathStatements(t *testing.T) {
+	root, ok := palbaseRoot()
+	if !ok {
+		t.Skip("not inside the palbase parent checkout: no modules/ + platform/ tree to take the census over")
+	}
+	hits, files := scanGo(t, root, "search_path", orchestratorExcluded)
+	t.Logf("census over %d production .go files under %s (excluding %v)", files, root, orchestratorExcluded)
+	if len(hits) > 0 {
+		report(t, "search_path", hits)
+	}
+}
