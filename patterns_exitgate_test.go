@@ -24,7 +24,10 @@
 
 package tenantpool_test
 
-import "testing"
+import (
+	"regexp"
+	"testing"
+)
 
 // orchestratorExcluded is pruned from the DEL-016 census, with the reason
 // stated here rather than applied silently: modules/orchestrator is a CLOUD
@@ -51,12 +54,31 @@ var orchestratorExcluded = []string{"modules/orchestrator"}
 //
 // Mutation: re-add a `SET search_path` anywhere under modules/ or platform/
 // outside the exclusion above, and this test goes red naming the file and line.
+// tenantSearchPath matches the two shapes that SELECT a schema, and only those.
+//
+// `SET search_path TO env_<id>` (and its LOCAL form) is the multi-tenant switch:
+// the target is dynamic, so isolation becomes a property of a session variable.
+// `RuntimeParams["search_path"]` is the same choice made at dial time — a
+// connection pinned to one module's schema is a connection the other eight
+// cannot use.
+//
+// What it deliberately does NOT match: `SET LOCAL search_path = public`. That is
+// injection hardening, not tenancy — transaction-scoped, pinned to a constant,
+// and issued in the same statement as `SET LOCAL ROLE` so a hostile schema
+// cannot shadow a function the query resolves (see
+// modules/database/proxy/internal/handler/handler.go:89). Banning the bare word
+// would leave exactly two ways to green this gate: weaken the assertion, or
+// delete a security control. Both are forbidden, so the gate matches the
+// statement instead of the word — the same regex three module-level guards in
+// this run already use.
+var tenantSearchPath = regexp.MustCompile(`(?i)(SET\s+(LOCAL\s+)?search_path\s+TO\b)|(RuntimeParams\s*\[\s*"search_path"\s*\])`)
+
 func TestDEL016_NoSearchPathStatements(t *testing.T) {
 	root, ok := palbaseRoot()
 	if !ok {
 		t.Skip("not inside the palbase parent checkout: no modules/ + platform/ tree to take the census over")
 	}
-	hits, files := scanGo(t, root, "search_path", orchestratorExcluded)
+	hits, files := scanGoRe(t, root, tenantSearchPath, orchestratorExcluded)
 	t.Logf("census over %d production .go files under %s (excluding %v)", files, root, orchestratorExcluded)
 	if len(hits) > 0 {
 		report(t, "search_path", hits)

@@ -3,6 +3,7 @@ package tenantpool_test
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -94,7 +95,22 @@ var prunedDirs = map[string]bool{".git": true, "node_modules": true, ".next": tr
 // — wrong root, moved directory, a prune rule that swallowed the tree — would
 // otherwise return zero hits and read as a pass. That is the vacuous-guard
 // failure this suite exists to prevent, so it is checked rather than assumed.
+// scanGoRe is scanGo with a regexp instead of a substring. Some patterns are
+// only a violation in one shape: `search_path` names both the multi-tenant
+// schema switch and an injection-hardening line that must survive, so a
+// substring census cannot tell a door back to shared schemas from a security
+// control. Where the distinction matters, match the statement, not the word.
+func scanGoRe(t *testing.T, root string, re *regexp.Regexp, excludeRel []string) (hits []hit, filesRead int) {
+	t.Helper()
+	return scanGoMatch(t, root, excludeRel, func(line string) bool { return re.MatchString(line) })
+}
+
 func scanGo(t *testing.T, root, pattern string, excludeRel []string) (hits []hit, filesRead int) {
+	t.Helper()
+	return scanGoMatch(t, root, excludeRel, func(line string) bool { return strings.Contains(line, pattern) })
+}
+
+func scanGoMatch(t *testing.T, root string, excludeRel []string, match func(string) bool) (hits []hit, filesRead int) {
 	t.Helper()
 	for _, top := range []string{"modules", "platform"} {
 		base := filepath.Join(root, top)
@@ -128,7 +144,7 @@ func scanGo(t *testing.T, root, pattern string, excludeRel []string) (hits []hit
 			}
 			filesRead++
 			for i, line := range strings.Split(string(body), "\n") {
-				if strings.Contains(line, pattern) {
+				if match(line) {
 					hits = append(hits, hit{path: rel, line: i + 1, text: line})
 				}
 			}
