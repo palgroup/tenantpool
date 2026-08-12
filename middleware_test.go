@@ -1,200 +1,19 @@
 package tenantpool
 
 import (
-	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"bytes"
+	"context"
+	"os"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// headerResolver reads the tenant ID from an HTTP header, mapping an absent
-// value to ErrTenantNotFound so the default error handler answers 404 rather
-// than 500.
-//
-// Package-level HeaderResolver/StaticResolver were removed with the rest of the
-// per-tenant resolution machinery: a single-tenant stack never identifies a
-// tenant from a request. These Middleware tests are the only remaining consumer
-// of that shape, so the resolver they exercise lives here with them.
-func headerResolver(name string) Resolver {
-	return func(r *http.Request) (string, error) {
-		v := r.Header.Get(name)
-		if v == "" {
-			return "", fmt.Errorf("%w: header %q missing", ErrTenantNotFound, name)
-		}
-		return v, nil
-	}
-}
-
-func TestMiddleware_SingleMode_AttachesPool(t *testing.T) {
-	r, err := New(Config{DatabaseURL: "postgres://u:p@127.0.0.1:1/db?sslmode=disable"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	var got bool
-	h := r.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		_, ok := PoolFromCtxOK(req.Context())
-		got = ok
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest("GET", "/", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("status=%d", rec.Code)
-	}
-	if !got {
-		t.Error("handler did not see a pool in ctx")
-	}
-}
-
-func TestMiddleware_MultiMode_UsesResolver(t *testing.T) {
-	r, err := New(Config{
-		DSNBuilder: fakeDSN,
-		Resolver:   headerResolver("X-Tenant-Ref"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	h := r.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if _, ok := PoolFromCtxOK(req.Context()); !ok {
-			t.Error("no pool in ctx")
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest("GET", "/", nil)
-	req.Header.Set("X-Tenant-Ref", "t1")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("status=%d", rec.Code)
-	}
-}
-
-func TestMiddleware_MissingTenantHeader_Returns404(t *testing.T) {
-	r, err := New(Config{
-		DSNBuilder: fakeDSN,
-		Resolver:   headerResolver("X-Tenant-Ref"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	h := r.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		t.Error("handler should not run")
-	}))
-
-	req := httptest.NewRequest("GET", "/", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status=%d, want 404", rec.Code)
-	}
-}
-
-func TestMiddleware_CustomErrorHandler(t *testing.T) {
-	r, err := New(Config{
-		DSNBuilder: fakeDSN,
-		Resolver:   headerResolver("X-Tenant-Ref"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	var gotErr error
-	custom := func(w http.ResponseWriter, req *http.Request, err error) {
-		gotErr = err
-		http.Error(w, "custom", http.StatusTeapot)
-	}
-
-	h := r.Middleware(WithErrorHandler(custom))(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		t.Error("handler should not run on resolver error")
-	}))
-
-	req := httptest.NewRequest("GET", "/", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusTeapot {
-		t.Errorf("status=%d, want 418", rec.Code)
-	}
-	if !errors.Is(gotErr, ErrTenantNotFound) {
-		t.Errorf("captured err=%v, want ErrTenantNotFound", gotErr)
-	}
-}
-
-func TestMiddleware_WithResolverOverride(t *testing.T) {
-	r, err := New(Config{
-		DSNBuilder: fakeDSN,
-		Resolver:   headerResolver("X-Tenant-Ref"), // default
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	// Override: extract from query param instead.
-	override := func(req *http.Request) (string, error) {
-		if v := req.URL.Query().Get("tid"); v != "" {
-			return v, nil
-		}
-		return "", ErrTenantNotFound
-	}
-
-	var seenTenant string
-	h := r.Middleware(WithResolver(override))(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if _, ok := PoolFromCtxOK(req.Context()); ok {
-			seenTenant = "ok"
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest("GET", "/?tid=t1", nil)
-	// NB no X-Tenant-Ref header; default resolver would have failed.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("status=%d", rec.Code)
-	}
-	if seenTenant != "ok" {
-		t.Error("override resolver did not populate ctx")
-	}
-}
-
-func TestMiddleware_MultiModeNoResolver_Errors(t *testing.T) {
-	r, err := New(Config{
-		DSNBuilder: fakeDSN,
-		// no Resolver
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	h := r.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		t.Error("handler should not run")
-	}))
-
-	req := httptest.NewRequest("GET", "/", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("status=%d, want 500", rec.Code)
-	}
-}
+// The Middleware tests that used to live here went with Registry.Middleware
+// itself (DEL-004), and the file-local headerResolver they shared went with
+// them: every one of them asserted that a tenant identifier taken off a request
+// selected the pool, which is precisely the behaviour a single-tenant stack must
+// not have. What is left tests the context carriage the helpers still provide.
 
 func TestPoolFromCtx_PanicsWhenMissing(t *testing.T) {
 	defer func() {
@@ -202,29 +21,73 @@ func TestPoolFromCtx_PanicsWhenMissing(t *testing.T) {
 			t.Error("expected panic")
 		}
 	}()
-	_ = PoolFromCtx(httptest.NewRequest("GET", "/", nil).Context())
+	_ = PoolFromCtx(context.Background())
 }
 
 func TestPoolFromCtxOK_FalseWhenMissing(t *testing.T) {
-	_, ok := PoolFromCtxOK(httptest.NewRequest("GET", "/", nil).Context())
+	_, ok := PoolFromCtxOK(context.Background())
 	if ok {
 		t.Error("expected false")
 	}
 }
 
+// TestWithPool_RoundTrip locks the surviving half of DEL-004: the three ctx
+// helpers 457 call sites depend on. It builds the pool directly instead of
+// through the Registry so the lock keeps holding when the Registry's own
+// accessor changes shape.
 func TestWithPool_RoundTrip(t *testing.T) {
-	r, err := New(Config{DatabaseURL: "postgres://u:p@127.0.0.1:1/db?sslmode=disable"})
+	pool, err := pgxpool.New(context.Background(), "postgres://u:p@127.0.0.1:1/db?sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	defer pool.Close()
 
-	pool, err := r.Get(httptest.NewRequest("GET", "/", nil).Context(), "ignored")
+	ctx := WithPool(context.Background(), pool)
+	if got := PoolFromCtx(ctx); got != pool {
+		t.Error("PoolFromCtx did not return the pool WithPool attached")
+	}
+	got, ok := PoolFromCtxOK(ctx)
+	if !ok || got != pool {
+		t.Errorf("PoolFromCtxOK = (%v, %v), want the attached pool and true", got, ok)
+	}
+}
+
+// TestDEL004_RegistryHasNoRequestMiddleware locks that the pool is no longer
+// resolved per request: in a single-tenant stack the connection is fixed at
+// boot, so nothing about an incoming request may pick it.
+//
+// The test reads the source rather than the symbol table because the point is
+// that these identifiers no longer exist to be referenced — a compile-time
+// assertion would need them to compile. It also asserts the KEPT side of the
+// same inventory entry, so deleting middleware.go outright fails too.
+func TestDEL004_RegistryHasNoRequestMiddleware(t *testing.T) {
+	src, err := os.ReadFile("middleware.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := WithPool(httptest.NewRequest("GET", "/", nil).Context(), pool)
-	if got, _ := PoolFromCtxOK(ctx); got != pool {
-		t.Error("WithPool round-trip mismatch")
+	// Exactly the symbols DEL-004 scopes: the per-request resolution path.
+	for _, gone := range []string{
+		"func (r *Registry) Middleware(",
+		"MiddlewareOption",
+		"middlewareOptions",
+		"func WithResolver(",
+		"func WithErrorHandler(",
+		"type ErrorHandler ",
+		"type Resolver ",
+		"func DefaultErrorHandler(",
+	} {
+		if bytes.Contains(src, []byte(gone)) {
+			t.Errorf("%q must be gone: the pool is chosen at boot, not per request", gone)
+		}
+	}
+	// The helpers survive — 457 call sites across eight modules read them.
+	for _, kept := range []string{
+		"func PoolFromCtx(",
+		"func PoolFromCtxOK(",
+		"func WithPool(",
+	} {
+		if !bytes.Contains(src, []byte(kept)) {
+			t.Errorf("%q must stay: 457 call sites depend on it", kept)
+		}
 	}
 }

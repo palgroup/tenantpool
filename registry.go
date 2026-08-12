@@ -46,10 +46,6 @@ import (
 //   - DSNBuilder: multi-tenant mode, raw form. The caller fully owns
 //     the DSN string returned per tenant — useful when the secret
 //     source is bespoke (vault token sidecar, etc).
-//
-// Resolver (HTTP tenant identification) is required for any multi-tenant
-// caller that uses Middleware; background workers that call Get with
-// explicit tenant IDs can omit it.
 type Config struct {
 	// DatabaseURL puts the Registry in single-database mode.
 	DatabaseURL string
@@ -59,11 +55,6 @@ type Config struct {
 	// DirectDSN helpers in this package, or a custom closure built by the
 	// caller.
 	DSNBuilder func(tenantID string) (string, error)
-
-	// Resolver extracts the tenant ID from an HTTP request for use by
-	// Middleware. Optional when the Registry is only consumed by
-	// background workers that call Get with an explicit tenant ID.
-	Resolver Resolver
 
 	// MaxPoolsCached caps the number of live tenant pools. When exceeded,
 	// the least-recently-used pool is closed in the background.
