@@ -98,7 +98,8 @@ func TestNew_RejectsUnparseableDSN(t *testing.T) {
 func TestPool_IsTheSamePoolOnEveryCall(t *testing.T) {
 	r := newRegistry(t)
 
-	var pool *pgxpool.Pool = r.Pool() // compile-time lock on the return type
+	pool := r.Pool()
+	var _ *pgxpool.Pool = pool // compile-time lock on the return type
 	if pool == nil {
 		t.Fatal("Pool() returned nil")
 	}
