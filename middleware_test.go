@@ -2,10 +2,29 @@ package tenantpool
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+// headerResolver reads the tenant ID from an HTTP header, mapping an absent
+// value to ErrTenantNotFound so the default error handler answers 404 rather
+// than 500.
+//
+// Package-level HeaderResolver/StaticResolver were removed with the rest of the
+// per-tenant resolution machinery: a single-tenant stack never identifies a
+// tenant from a request. These Middleware tests are the only remaining consumer
+// of that shape, so the resolver they exercise lives here with them.
+func headerResolver(name string) Resolver {
+	return func(r *http.Request) (string, error) {
+		v := r.Header.Get(name)
+		if v == "" {
+			return "", fmt.Errorf("%w: header %q missing", ErrTenantNotFound, name)
+		}
+		return v, nil
+	}
+}
 
 func TestMiddleware_SingleMode_AttachesPool(t *testing.T) {
 	r, err := New(Config{DatabaseURL: "postgres://u:p@127.0.0.1:1/db?sslmode=disable"})
@@ -36,7 +55,7 @@ func TestMiddleware_SingleMode_AttachesPool(t *testing.T) {
 func TestMiddleware_MultiMode_UsesResolver(t *testing.T) {
 	r, err := New(Config{
 		DSNBuilder: fakeDSN,
-		Resolver:   HeaderResolver("X-Tenant-Ref"),
+		Resolver:   headerResolver("X-Tenant-Ref"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +82,7 @@ func TestMiddleware_MultiMode_UsesResolver(t *testing.T) {
 func TestMiddleware_MissingTenantHeader_Returns404(t *testing.T) {
 	r, err := New(Config{
 		DSNBuilder: fakeDSN,
-		Resolver:   HeaderResolver("X-Tenant-Ref"),
+		Resolver:   headerResolver("X-Tenant-Ref"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +105,7 @@ func TestMiddleware_MissingTenantHeader_Returns404(t *testing.T) {
 func TestMiddleware_CustomErrorHandler(t *testing.T) {
 	r, err := New(Config{
 		DSNBuilder: fakeDSN,
-		Resolver:   HeaderResolver("X-Tenant-Ref"),
+		Resolver:   headerResolver("X-Tenant-Ref"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +137,7 @@ func TestMiddleware_CustomErrorHandler(t *testing.T) {
 func TestMiddleware_WithResolverOverride(t *testing.T) {
 	r, err := New(Config{
 		DSNBuilder: fakeDSN,
-		Resolver:   HeaderResolver("X-Tenant-Ref"), // default
+		Resolver:   headerResolver("X-Tenant-Ref"), // default
 	})
 	if err != nil {
 		t.Fatal(err)

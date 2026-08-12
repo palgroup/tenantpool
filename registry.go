@@ -19,7 +19,6 @@
 //	    DSNBuilder: tenantpool.SupavisorDSN(tenantpool.SupavisorOpts{
 //	        Host: "supavisor:5432", Schema: "auth", Password: "…",
 //	    }),
-//	    Resolver: tenantpool.HeaderResolver("X-Tenant-Ref"),
 //	})
 //
 // Either way, handlers read the pool through pgctx helpers:
@@ -40,18 +39,13 @@ import (
 
 // Config describes how a Registry resolves pools.
 //
-// Exactly one of DatabaseURL, DSNBuilder, or DSNTemplate must be set.
+// Exactly one of DatabaseURL or DSNBuilder must be set.
 //
 //   - DatabaseURL: single-database mode. Every Get returns the same
 //     pool; tenantID is ignored.
 //   - DSNBuilder: multi-tenant mode, raw form. The caller fully owns
 //     the DSN string returned per tenant — useful when the secret
 //     source is bespoke (vault token sidecar, etc).
-//   - DSNTemplate + PasswordResolver: multi-tenant mode, declarative
-//     form. The template substitutes {{tenant}} and {{password}}; the
-//     resolver supplies the password per-tenant. Production callers
-//     should land here so password fetch + caching is one well-tested
-//     path across modules.
 //
 // Resolver (HTTP tenant identification) is required for any multi-tenant
 // caller that uses Middleware; background workers that call Get with
@@ -61,34 +55,10 @@ type Config struct {
 	DatabaseURL string
 
 	// DSNBuilder returns the connection string for a given tenant ID.
-	// Mutually exclusive with DSNTemplate. Typical implementations come
-	// from the SupavisorDSN / PgBouncerDSN / DirectDSN helpers in this
-	// package, or a custom closure built by the caller.
+	// Typical implementations come from the SupavisorDSN / PgBouncerDSN /
+	// DirectDSN helpers in this package, or a custom closure built by the
+	// caller.
 	DSNBuilder func(tenantID string) (string, error)
-
-	// DSNTemplate is the per-tenant connection string template with
-	// {{tenant}} and (optionally) {{password}} placeholders. Used in
-	// combination with PasswordResolver — the registry handles the
-	// substitution + password fetch. Mutually exclusive with DSNBuilder.
-	//
-	// Example:
-	//
-	//	postgres://palbase_auth.{{tenant}}:{{password}}@supavisor:5432/{{tenant}}?sslmode=disable
-	DSNTemplate string
-
-	// PasswordResolver supplies the tenant role password substituted
-	// into DSNTemplate's {{password}} placeholder. Required when the
-	// template contains {{password}}. Wrap with
-	// NewCachingPasswordResolver for production deployments.
-	PasswordResolver PasswordResolver
-
-	// PoolerHostResolver supplies the pooler (Supavisor) host substituted
-	// into DSNTemplate's {{pooler}} placeholder. Required when the
-	// template contains {{pooler}} — tenants are spread across cells and
-	// each cell has its own pooler, so no single literal host is correct
-	// for a multi-tenant service. Use NewOrchestratorPoolerHostResolver
-	// for production deployments.
-	PoolerHostResolver PoolerHostResolver
 
 	// Resolver extracts the tenant ID from an HTTP request for use by
 	// Middleware. Optional when the Registry is only consumed by
@@ -160,23 +130,11 @@ func New(cfg Config) (*Registry, error) {
 	if cfg.DSNBuilder != nil {
 		modeCount++
 	}
-	if cfg.DSNTemplate != "" {
-		modeCount++
-	}
 	if modeCount == 0 {
-		return nil, fmt.Errorf("%w: one of DatabaseURL, DSNBuilder, or DSNTemplate must be set", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: one of DatabaseURL or DSNBuilder must be set", ErrInvalidConfig)
 	}
 	if modeCount > 1 {
-		return nil, fmt.Errorf("%w: DatabaseURL, DSNBuilder, and DSNTemplate are mutually exclusive", ErrInvalidConfig)
-	}
-	// DSNTemplate + PasswordResolver bake into a DSNBuilder so the
-	// hot path stays unchanged below — the registry only knows about
-	// "either single pool or per-tenant builder".
-	if cfg.DSNTemplate != "" {
-		if cfg.PasswordResolver == nil {
-			return nil, fmt.Errorf("%w: DSNTemplate requires PasswordResolver", ErrInvalidConfig)
-		}
-		cfg.DSNBuilder = dsnBuilderFromTemplate(cfg.DSNTemplate, cfg.PasswordResolver, cfg.PoolerHostResolver)
+		return nil, fmt.Errorf("%w: DatabaseURL and DSNBuilder are mutually exclusive", ErrInvalidConfig)
 	}
 	applyDefaults(&cfg)
 
@@ -186,7 +144,7 @@ func New(cfg Config) (*Registry, error) {
 	}
 
 	if cfg.DatabaseURL != "" {
-		pool, err := r.buildPool(context.Background(), "", cfg.DatabaseURL)
+		pool, err := r.buildPool(context.Background(), cfg.DatabaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("open single pool: %w", err)
 		}
@@ -248,16 +206,10 @@ func (r *Registry) Get(ctx context.Context, tenantID string) (*pgxpool.Pool, err
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrTenantNotFound, err)
 		}
-		pool, err := r.buildPool(ctx, tenantID, dsn)
+		pool, err := r.buildPool(ctx, dsn)
 		if err != nil {
 			return nil, err
 		}
-		// A resolved pooler host can be stale: routing moves, the registry
-		// healer prunes the old pooler, and the resolver keeps serving its
-		// cached answer for the rest of the TTL. Verify once here and repoint
-		// if the pooler disowns the tenant — see verifyOrRepoint, which changes
-		// nothing for any other error.
-		pool = r.verifyOrRepoint(ctx, tenantID, pool)
 
 		r.mu.Lock()
 		r.cache[tenantID] = &poolEntry{pool: pool, lastAccess: time.Now()}
@@ -283,10 +235,8 @@ func (r *Registry) Get(ctx context.Context, tenantID string) (*pgxpool.Pool, err
 	return v.(*pgxpool.Pool), nil
 }
 
-// buildPool dials a tenant's pool. tenantID is carried so the connection's
-// server-error hook can name the tenant it must repoint; single mode passes ""
-// and installs no hook, having no tenant to repoint.
-func (r *Registry) buildPool(ctx context.Context, tenantID, dsn string) (*pgxpool.Pool, error) {
+// buildPool dials a pool for the given DSN.
+func (r *Registry) buildPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse dsn: %w", ErrInvalidConfig, err)
@@ -298,13 +248,6 @@ func (r *Registry) buildPool(ctx context.Context, tenantID, dsn string) (*pgxpoo
 		if err := r.cfg.ConfigurePool(cfg); err != nil {
 			return nil, fmt.Errorf("%w: configure pool: %w", ErrInvalidConfig, err)
 		}
-	}
-
-	// AFTER ConfigurePool, so a caller's own handler is the one wrapped rather
-	// than one this overwrites. Without this the hook is dead code — the exact
-	// mistake e97dcb1 had to fix for verifyOrRepoint.
-	if tenantID != "" {
-		cfg.ConnConfig.OnPgError = r.onPgErrorFor(tenantID, cfg.ConnConfig.OnPgError)
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)

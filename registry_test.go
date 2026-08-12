@@ -26,7 +26,6 @@ func newMultiRegistry(t *testing.T, maxPools int) *Registry {
 	t.Helper()
 	r, err := New(Config{
 		DSNBuilder:     fakeDSN,
-		Resolver:       StaticResolver("t1"),
 		MaxPoolsCached: maxPools,
 	})
 	if err != nil {
