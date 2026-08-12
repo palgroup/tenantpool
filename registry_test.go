@@ -9,6 +9,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Pool must keep returning *pgxpool.Pool and must keep taking no arguments:
+// the single-tenant stack opens one pool at boot, so a signature drifting back
+// to Pool(tenantID) would be per-request resolution returning under a new name.
+// Asserting the method set catches that; asserting one call's inferred type
+// would not.
+var _ interface{ Pool() *pgxpool.Pool } = (*Registry)(nil)
+
 // registrySource reads registry.go so the DEL tests below can assert on
 // identifiers that no longer exist. A compile-time assertion cannot express
 // "this symbol is gone" — it would need the symbol to compile.
@@ -99,7 +106,6 @@ func TestPool_IsTheSamePoolOnEveryCall(t *testing.T) {
 	r := newRegistry(t)
 
 	pool := r.Pool()
-	var _ *pgxpool.Pool = pool // compile-time lock on the return type
 	if pool == nil {
 		t.Fatal("Pool() returned nil")
 	}
