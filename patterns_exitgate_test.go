@@ -43,17 +43,21 @@ import (
 // a search_path must fail this gate.
 var orchestratorExcluded = []string{"modules/orchestrator"}
 
-// TestDEL016_NoSearchPathStatements locks the removal of schema-switching.
+// scanGoRe is scanGo with a regexp instead of a substring. It lives here rather
+// than beside its sibling because this file is its only caller, and a helper
+// compiled under every tag with a caller under one is dead code to the default
+// build — which is exactly what CI reported.
 //
-// v1 gave every tenant a schema in one shared database and reached it with
-// `SET search_path TO env_<id>`, which made isolation a property of a session
-// variable: any code path that opened a connection without setting it, or set
-// it from an unvalidated request value, crossed tenants. A single-tenant stack
-// owns its whole database, so the statement has nothing left to select and its
-// continued presence is a door back to the shared-schema model.
-//
-// Mutation: re-add a `SET search_path` anywhere under modules/ or platform/
-// outside the exclusion above, and this test goes red naming the file and line.
+// Some patterns are only a violation in one shape: `search_path` names both the
+// multi-tenant schema switch and an injection-hardening line that must survive,
+// so a substring census cannot tell a door back to shared schemas from a
+// security control. Where the distinction matters, match the statement, not the
+// word.
+func scanGoRe(t *testing.T, root string, re *regexp.Regexp, excludeRel []string) (hits []hit, filesRead int) {
+	t.Helper()
+	return scanGoMatch(t, root, excludeRel, func(line string) bool { return re.MatchString(line) })
+}
+
 // tenantSearchPath matches the two shapes that SELECT a schema, and only those.
 //
 // `SET search_path TO env_<id>` (and its LOCAL form) is the multi-tenant switch:
@@ -73,6 +77,17 @@ var orchestratorExcluded = []string{"modules/orchestrator"}
 // this run already use.
 var tenantSearchPath = regexp.MustCompile(`(?i)(SET\s+(LOCAL\s+)?search_path\s+TO\b)|(RuntimeParams\s*\[\s*"search_path"\s*\])`)
 
+// TestDEL016_NoSearchPathStatements locks the removal of schema-switching.
+//
+// v1 gave every tenant a schema in one shared database and reached it with
+// `SET search_path TO env_<id>`, which made isolation a property of a session
+// variable: any code path that opened a connection without setting it, or set
+// it from an unvalidated request value, crossed tenants. A single-tenant stack
+// owns its whole database, so the statement has nothing left to select and its
+// continued presence is a door back to the shared-schema model.
+//
+// Mutation: re-add a `SET search_path TO <anything>` under modules/ or platform/
+// outside the exclusion above, and this test goes red naming the file and line.
 func TestDEL016_NoSearchPathStatements(t *testing.T) {
 	root, ok := palbaseRoot()
 	if !ok {
